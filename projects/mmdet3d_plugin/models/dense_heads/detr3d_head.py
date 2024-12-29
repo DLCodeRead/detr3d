@@ -118,6 +118,15 @@ class Detr3DHead(DETRHead):
 
         query_embeds = self.query_embedding.weight
         
+        
+        # 输入FPN后的特征mlvl_feats(B,N,C,H,W)，调用Detr3DTransformer.forward()方法，
+        # 得到每层的特征输出hs(num_dec_layers, B, num_query, embed_dims)
+        # 对每层的特征都要通过分类、回归分支得到预测结果。
+        
+        # 得到transformer每一层的输出embedding
+        # hs(num_dec_layers, bs, num_query, embed_dims): 每个layer的输出特征
+        # init_reference(bs, num_queries, 3): 参考点的初始坐标(layer0)
+        # inter_references(num_dec_layers, bs,num_query, 3): 每一层生成的参考点
         hs, init_reference, inter_references = self.transformer(
             mlvl_feats,
             query_embeds,
@@ -133,10 +142,13 @@ class Detr3DHead(DETRHead):
                 reference = init_reference
             else:
                 reference = inter_references[lvl - 1]
-            reference = inverse_sigmoid(reference)
+            reference = inverse_sigmoid(reference) 
             outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])
+            tmp = self.reg_branches[lvl](hs[lvl]) # cx, cy, w, l, cz, h, theta, vx, vy
 
+            # 对于回归分支中预测的中心点(x,y,z)，每次预测出的结果是相对上一层的偏移量。
+            # 所以参考点reference=inter_references[lvl - 1]，
+            # 预测结果tmp的(cx,cy,cz)要加上上一层的参考点坐标，得到本层最终预测坐标
             # TODO: check the shape of reference
             assert reference.shape[-1] == 3
             tmp[..., 0:2] += reference[..., 0:2]
