@@ -80,6 +80,8 @@ class Detr3DHead(DETRHead):
         num_pred = (self.transformer.decoder.num_layers + 1) if \
             self.as_two_stage else self.transformer.decoder.num_layers
 
+        #NOTE share cls_branches and reg_branches if box_refine enable
+        # other wise create same $num_pred cls and reg branches. 
         if self.with_box_refine:
             self.cls_branches = _get_clones(fc_cls, num_pred)
             self.reg_branches = _get_clones(reg_branch, num_pred)
@@ -137,6 +139,9 @@ class Detr3DHead(DETRHead):
         outputs_classes = []
         outputs_coords = []
 
+        # 对于回归分支中预测的中心点(x,y,z)，每次预测出的结果是相对上一层的偏移量。
+        # 所以参考点reference=inter_references[lvl - 1]，
+        # 预测结果tmp的(c_x,c_y,c_z)要加上上一层的参考点坐标，得到本层最终预测坐标
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 reference = init_reference
@@ -146,6 +151,7 @@ class Detr3DHead(DETRHead):
             outputs_class = self.cls_branches[lvl](hs[lvl])
             tmp = self.reg_branches[lvl](hs[lvl]) # cx, cy, w, l, cz, h, theta, vx, vy
 
+            # 本层预测最终参考点坐标 = 本层预测偏移量 + 上一层的参考点
             # 对于回归分支中预测的中心点(x,y,z)，每次预测出的结果是相对上一层的偏移量。
             # 所以参考点reference=inter_references[lvl - 1]，
             # 预测结果tmp的(cx,cy,cz)要加上上一层的参考点坐标，得到本层最终预测坐标

@@ -60,7 +60,9 @@ class Detr3DTransformer(BaseModule):
 
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
-        self.reference_points = nn.Linear(self.embed_dims, 3)
+        #NOTE self.reference_points是实际能够回归坐标的层，基于学习到的query
+        # 而ref_branch则是基于投影的点学习reference_points的增量
+        self.reference_points = nn.Linear(self.embed_dims, 3) 
 
     def init_weights(self):
         """Initialize the transformer weights."""
@@ -119,16 +121,21 @@ class Detr3DTransformer(BaseModule):
         query_pos, query = torch.split(query_embed, self.embed_dims , dim=1)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
         query = query.unsqueeze(0).expand(bs, -1, -1)
+
+        #NOTE
+        # 首先将query_embed按通道C拆分为query_pos和query
+        # query_pos经过一层MLP生成初始的参考点reference_points(bs, num_queries, 3)
+        # 将query, value, query_pos, reference_points送入Detr3DTransformerDecoder的forward()中进行Attention的计算
         reference_points = self.reference_points(query_pos)
         reference_points = reference_points.sigmoid()
-        init_reference_out = reference_points
+        init_reference_out = reference_points  # 初始化的3d点, 由query_position通过Linear获得
 
         # decoder
         query = query.permute(1, 0, 2)
         query_pos = query_pos.permute(1, 0, 2)
         inter_states, inter_references = self.decoder(
             query=query,
-            key=None,
+            key=None,  # 默认key为none，后面会被赋值为query, value为mlvl_feats
             value=mlvl_feats,
             query_pos=query_pos,
             reference_points=reference_points,
@@ -180,6 +187,7 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
         intermediate_reference_points = []
         for lid, layer in enumerate(self.layers):
             reference_points_input = reference_points
+
             output = layer(
                 output,
                 *args,
@@ -187,8 +195,9 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
                 **kwargs)
             output = output.permute(1, 0, 2)
 
+            #NOTE refine and predict the final bounding box5
             if reg_branches is not None:
-                tmp = reg_branches[lid](output)
+                tmp = reg_branches[lid](output)  # 基于每一个layer输出的query, 回归reference_points的增量
                 
                 assert reference_points.shape[-1] == 3
 
@@ -275,7 +284,7 @@ class Detr3DCrossAtten(BaseModule):
         self.embed_dims = embed_dims
         self.num_levels = num_levels
         self.num_heads = num_heads
-        self.num_points = num_points
+        self.num_points = num_points # 投影回的2D特征图中采样点数
         self.num_cams = num_cams
         self.attention_weights = nn.Linear(embed_dims,
                                            num_cams*num_levels*num_points)
@@ -358,9 +367,15 @@ class Detr3DCrossAtten(BaseModule):
 
         bs, num_query, _ = query.size()
 
+        # attention_weights：[B, 1, num_query, num_camera(6), num_points, num_levels]
+        # 基于query学习的权重与sample后的feature相称
         attention_weights = self.attention_weights(query).view(
             bs, 1, num_query, self.num_cams, self.num_points, self.num_levels)
         
+        # 从2D FPN的特征图中采样
+        # reference_points_3d: [B, num_query, 3]
+        # output: [B, C, num_query, num_camera(6), num_points, num_levels(4)]
+        # mask: [B, 1, num_query, num_camera(6), num_points, 1]        
         reference_points_3d, output, mask = feature_sampling(
             value, reference_points, self.pc_range, kwargs['img_metas'])
         output = torch.nan_to_num(output)
@@ -368,6 +383,8 @@ class Detr3DCrossAtten(BaseModule):
 
         attention_weights = attention_weights.sigmoid() * mask
         output = output * attention_weights
+
+        #NOTE 在num_camera, num_points, num_levels上做平均
         output = output.sum(-1).sum(-1).sum(-1)
         output = output.permute(2, 0, 1)
         
@@ -379,6 +396,11 @@ class Detr3DCrossAtten(BaseModule):
 
 
 def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
+    #NOTE
+    # 将3D点(refernce_points_3d)投影到不同的cam上获得不同cam上的坐标
+
+    #NOTE
+    # 获得不同cam的3d与2d透视矩阵
     lidar2img = []
     for img_meta in img_metas:
         lidar2img.append(img_meta['lidar2img'])
@@ -386,6 +408,9 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     lidar2img = reference_points.new_tensor(lidar2img) # (B, N, 4, 4)
     reference_points = reference_points.clone()
     reference_points_3d = reference_points.clone()
+
+    #NOTE
+    # 3d -> 2d 透视变化
     reference_points[..., 0:1] = reference_points[..., 0:1]*(pc_range[3] - pc_range[0]) + pc_range[0]
     reference_points[..., 1:2] = reference_points[..., 1:2]*(pc_range[4] - pc_range[1]) + pc_range[1]
     reference_points[..., 2:3] = reference_points[..., 2:3]*(pc_range[5] - pc_range[2]) + pc_range[2]
@@ -395,14 +420,20 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     num_cam = lidar2img.size(1)
     reference_points = reference_points.view(B, 1, num_query, 4).repeat(1, num_cam, 1, 1).unsqueeze(-1)
     lidar2img = lidar2img.view(B, num_cam, 1, 4, 4).repeat(1, 1, num_query, 1, 1)
+    
+    # 左乘相机内外参矩阵转图片坐标
     reference_points_cam = torch.matmul(lidar2img, reference_points).squeeze(-1)
     eps = 1e-5
     mask = (reference_points_cam[..., 2:3] > eps)
+    
+    # 归一化在[-1, 1]之间, 消除坐标对跨level的feature影响
     reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
         reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3])*eps)
     reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
     reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
     reference_points_cam = (reference_points_cam - 0.5) * 2
+
+    # 投影后超过范围的为mask区域
     mask = (mask & (reference_points_cam[..., 0:1] > -1.0) 
                  & (reference_points_cam[..., 0:1] < 1.0) 
                  & (reference_points_cam[..., 1:2] > -1.0) 
@@ -410,6 +441,8 @@ def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
     mask = mask.view(B, num_cam, 1, num_query, 1, 1).permute(0, 2, 3, 1, 4, 5)
     mask = torch.nan_to_num(mask)
     sampled_feats = []
+
+    # 在FPN特征图上采样
     for lvl, feat in enumerate(mlvl_feats):
         B, N, C, H, W = feat.size()
         feat = feat.view(B*N, C, H, W)
