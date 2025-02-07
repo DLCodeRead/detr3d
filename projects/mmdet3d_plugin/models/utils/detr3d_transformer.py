@@ -124,7 +124,7 @@ class Detr3DTransformer(BaseModule):
 
         #NOTE
         # 首先将query_embed按通道C拆分为query_pos和query
-        # query_pos经过一层MLP生成初始的参考点reference_points(bs, num_queries, 3)
+        # query_pos经过一层MLP生成初始的3D参考点reference_points(bs, num_queries, 3)
         # 将query, value, query_pos, reference_points送入Detr3DTransformerDecoder的forward()中进行Attention的计算
         reference_points = self.reference_points(query_pos)
         reference_points = reference_points.sigmoid()
@@ -209,12 +209,15 @@ class Detr3DTransformerDecoder(TransformerLayerSequence):
                 
                 new_reference_points = new_reference_points.sigmoid()
 
+                # 不参与梯度计算
                 reference_points = new_reference_points.detach()
 
+            # NOTE
+            # output = weighted summation of feature from different cam & level + query + pe
             output = output.permute(1, 0, 2)
             if self.return_intermediate:
-                intermediate.append(output)
-                intermediate_reference_points.append(reference_points)
+                intermediate.append(output) # 外层变量名 hs
+                intermediate_reference_points.append(reference_points) # 外层变量名 inter_reference
 
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(
@@ -384,7 +387,7 @@ class Detr3DCrossAtten(BaseModule):
         attention_weights = attention_weights.sigmoid() * mask
         output = output * attention_weights
 
-        #NOTE 在num_camera, num_points, num_levels上做平均
+        #NOTE 在num_camera, num_points(1), num_levels上做平均
         output = output.sum(-1).sum(-1).sum(-1)
         output = output.permute(2, 0, 1)
         
